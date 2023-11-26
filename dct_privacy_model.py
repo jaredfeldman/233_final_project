@@ -205,7 +205,7 @@ def main():
     batch_sizes = [num_samples]
 
     # setup noise object
-    noise_accumulation = NoisyAccumulation.NoisyAccumulation()
+    noise_accumulation = NoisyAccumulation.NoisyAccumulation(budget_mean=4)
     noise_accumulation.train()
 
     # setup IR model

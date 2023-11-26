@@ -23,6 +23,13 @@ class NoisyAccumulation(nn.Module): # updated the default value for input_shape
 
     def scales(self):
         softmax = nn.Softmax()
+        print('In noise activation')
+        print(self.sensitivity)
+        print('Budget')
+        print(self.budget)
+        print('epsilon')
+        print((softmax(self.rhos.reshape(189 * self.h * self.w))* self.budget))
+        print('-----------')
         return (self.sensitivity / (softmax(self.rhos.reshape(189 * self.h * self.w))
                 * self.budget)).reshape(189, self.h, self.w)
 
