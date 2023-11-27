@@ -12,6 +12,12 @@ import cv2
 import torchvision.transforms as transforms
 import torch.distributed as dist
 import torch.nn.init as init
+import torch.optim as optim
+import torch.cpu.amp as amp
+from collections import OrderedDict
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Subset
+from ignite.metrics import Accuracy, Precision, Recall
 
 from PIL import Image, ImageEnhance
 
@@ -24,6 +30,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torchjpeg import dct
 from sklearn import preprocessing
+from ignite.utils import to_onehot
 
 
 """
@@ -40,6 +47,9 @@ Define the required inputs
 def arg_parse():
     parser = argparse.ArgumentParser(description='Train IRSE model with perturbed images based on DCT')
     parser.add_argument('--index-file', help='index file containing labels and image paths', required=True)
+    parser.add_argument('--epochs', type=int, default=5, help='number of epochs to train the model based on')
+    parser.add_argument('--run-perturbed', default=False, action='store_true', help='Run training model with perturbed images')
+    parser.add_argument('--run-clean', default=False, action='store_true', help='Run the training model with normal images')
 
     args = parser.parse_args()
     return args
@@ -47,7 +57,7 @@ def arg_parse():
 """
 Used to setup ImageDataset, load in data, and create an iterable
 """
-def prepare_data(index_file):
+def prepare_data(index_file, test_size=0.2):
     rgb_mean = [0.5, 0.5, 0.5] # for normalize inputs to [-1, 1]
     rgb_std = [0.5, 0.5, 0.5]
 
@@ -63,10 +73,16 @@ def prepare_data(index_file):
     # read in the data
     image_dataset.build_inputs()
 
+    # train/test split
+    train_idx, val_idx = train_test_split(list(range(len(image_dataset))), test_size=test_size)
+    train_dataset = Subset(image_dataset, train_idx)
+    validation_dataset = Subset(image_dataset, val_idx)
+
     # Use DataLoader to create an iteratable object
-    print('Read in a total of ' + str(image_dataset.sample_nums) + ' samples.')
-    image_data_loader = DataLoader(image_dataset, image_dataset.sample_nums, drop_last=False)
-    return image_data_loader, image_dataset.sample_nums
+    print('Read in a total of ' + str(len(train_idx) + len(val_idx)) + ' samples.')
+    train_data_loader = DataLoader(train_dataset, len(train_idx), drop_last=False)
+    test_data_loader = DataLoader(train_dataset, len(val_idx), drop_last=False)
+    return train_data_loader, test_data_loader, len(train_idx)
 
 """
 This is where the DCT magic happens
@@ -119,6 +135,32 @@ def images_to_batch(x):
     dct_block = dct_block.reshape(bs, -1, block_num, block_num)
     return dct_block
 
+def expand_tensor(x):
+    # scale_factor=8 does the blockify magic
+    x = F.interpolate(x, scale_factor=8, mode='bilinear', align_corners=True)
+
+    # assign variables batch size, channel, height, weight based on x.shape
+    bs, ch, h, w = x.shape
+
+    # set the number of blocks
+    block_num = h // 8
+    # gives you insight of the stack that is fed into the "upsampling" piece
+    x = x.view(bs * ch, 1, h, w)
+
+    # 8 fold upsampling
+    x = F.unfold(x, kernel_size=(8, 8), dilation=1, padding=0,
+                 stride=(8, 8))
+
+    # transposed to be able to feed into dct
+    x = x.transpose(1, 2)
+    x = x.view(bs, ch, -1, 8, 8)
+
+    x = x.view(bs, ch, block_num, block_num, 64).permute(0, 1, 4, 2, 3)
+
+    # gather
+    x = x.reshape(bs, -1, block_num, block_num)
+    return x
+
 def init_process_group():
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
@@ -149,6 +191,8 @@ def setup_arc_face(sample_nums):
                           class_split=class_shard,
                           scale=64,
                           margin=0.4)
+
+    del init_value
 
     return head, class_shard
 
@@ -183,9 +227,6 @@ def accuracy_dist(outputs, labels, class_split, topk=(1,5)):
     _, idx = _scores.topk(maxk, 0, True, True)
     pred = torch.gather(_preds, dim=0, index=idx)
     pred = pred.t()
-    print('in hereeee')
-    print(labels.shape)
-    print(pred.shape)
     correct = pred.eq(labels.expand_as(pred))
     res = []
     for k in topk:
@@ -194,26 +235,79 @@ def accuracy_dist(outputs, labels, class_split, topk=(1,5)):
 
     return res
 
-def main():
-    # setup the arguments required for this script
-    args = arg_parse()
-    init_process_group()
-    index_file = args.index_file
-    input_size = [112, 112]
 
-    training_data, num_samples = prepare_data(index_file)
+def separate_resnet_bn_paras(modules):
+    """ sepeated bn params and wo-bn params
+    """
+    all_parameters = modules.parameters()
+    paras_only_bn = []
+
+    for pname, param in modules.named_parameters():
+        if pname.find('bn') >= 0:
+            paras_only_bn.append(param)
+
+    paras_only_bn_id = list(map(id, paras_only_bn))
+    paras_wo_bn = list(filter(lambda p: id(p) not in paras_only_bn_id,
+                              all_parameters))
+
+    return paras_only_bn, paras_wo_bn
+
+def get_optimizer(backbone, heads):
+    """ build optimizers
+    """
+    backbone_paras_only_bn, backbone_paras_wo_bn = separate_resnet_bn_paras(backbone)
+    learning_rates = [0.1, 0.01, 0.001, 0.0001] # divide by 10
+    init_lr = learning_rates[0]
+    weight_decay = 0.0005
+    momentum = 0.9
+    backbone_opt = optim.SGD([
+        {'params': backbone_paras_wo_bn, 'weight_decay': weight_decay},
+        {'params': backbone_paras_only_bn}], lr=init_lr, momentum=momentum)
+
+    head_opts = OrderedDict()
+    for name, head in heads.items():
+        opt = optim.SGD([{'params': head.parameters()}], lr=init_lr, momentum=momentum, weight_decay=weight_decay)
+        head_opts[name] = opt
+
+    optimizer = {
+        'backbone': backbone_opt,
+        'heads': head_opts,
+    }
+    return optimizer
+
+def get_noise_opt(noise_model):
+    lrs_noise = [0.1, 0.01, 0.001, 0.0001]
+    optimizer = optim.Adam(list(noise_model.parameters()), lr=lrs_noise[0])
+    return optimizer
+
+def main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, run_perturbed=False):
+    # setup the arguments required for this script
+    #args = arg_parse()
+    #init_process_group()
+    #index_file = args.index_file
+    #input_size = [112, 112]
+
+    #training_data, num_samples = prepare_data(index_file)
     batch_sizes = [num_samples]
 
     # setup noise object
-    noise_accumulation = NoisyAccumulation.NoisyAccumulation(budget_mean=4)
+    #noise_accumulation = NoisyAccumulation.NoisyAccumulation(budget_mean=4)
     noise_accumulation.train()
 
     # setup IR model
-    irse_model = IRSEModel.IRSEModel(input_size, 50, 'ir')
+    #irse_model = IRSEModel.IRSEModel(input_size, 50, 'ir')
 
     # setup arcface
+    heads = OrderedDict()
     head, class_shard = setup_arc_face(num_samples)
-    head = [head]
+    heads[0] = head
+
+
+    optimizer = get_optimizer(irse_model, heads)
+    noise_opt = get_noise_opt(noise_accumulation)
+
+    backbone_opt, head_opts, noise_opt = optimizer['backbone'], list(optimizer['heads'].values()), noise_opt
+
 
     # loop through each sample in the dataloader object
     for step, samples in enumerate(training_data):
@@ -224,9 +318,12 @@ def main():
         targets = torch.as_tensor(targets)
         labels = targets
 
-        inputs = images_to_batch(inputs)
-        inputs = noise_accumulation(inputs)
+        if(run_perturbed):
+            inputs = images_to_batch(inputs)
+            inputs = noise_accumulation(inputs)
 
+
+        print(inputs.shape)
         features = irse_model(inputs)
 
         features_gather = AllGather.AllGather(features, 1)
@@ -250,22 +347,137 @@ def main():
         am_top5s = [AverageMeter.AverageMeter() for _ in batch_sizes]
 
         for i in range(len(batch_sizes)):
-            outputs, labels, original_outputs = head[i](all_features[i], all_labels[i])
+            outputs, labels, original_outputs = heads[i](all_features[i], all_labels[i])
 
             loss = setup_loss()
             loss = loss(outputs, labels)
+            print("labels we're sending to")
+            print(labels.shape)
             losses.append(loss)
             prec1 = accuracy_dist(original_outputs.data, all_labels[i], class_shard, topk=(1,num_samples))
             am_losses[i].update(loss.data.item(), all_features[i].size(0))
 
         # update summary and log_buffer
         scalars = {
-            'train/loss': am_losses
+            'train/loss': am_losses,
         }
 
         total_loss = sum(losses)
         print(total_loss)
 
+        # compute gradient and do SGD
+        backbone_opt.zero_grad()
+        noise_opt.zero_grad()
+        for head_opt in head_opts:
+            head_opt.zero_grad()
+
+        #print(total_loss)
+
+    return total_loss
+
+def set_optimizer_lr(optimizer, lr):
+    if isinstance(optimizer, dict):
+        backbone_opt, head_opts = optimizer['backbone'], optimizer['heads']
+        for param_group in backbone_opt.param_groups:
+            param_group['lr'] = lr
+        for _, head_opt in head_opts.items():
+            for param_group in head_opt.param_groups:
+                param_group['lr'] = lr
+    else:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+def adjust_lr(epoch, learning_rates, stages, optimizer):
+    """ Decay the learning rate based on schedule
+    """
+
+    pos = bisect(stages, epoch)
+    lr = learning_rates[pos]
+    logging.info("Current epoch {}, learning rate {}".format(epoch + 1, lr))
+
+    set_optimizer_lr(optimizer, lr)
+
+def thresholded_output_transform(output):
+    y_pred, y = output
+    y_pred = torch.round(y_pred)
+    print('in thresholdddd')
+    print(y_pred)
+    y_ohe = to_onehot(y, num_classes=y_pred.shape[1])
+    return y_pred, y_ohe
+
+def compute_validation_score(model , test_dat):
+    with torch.no_grad():
+        binary_accuracy = Accuracy(output_transform=thresholded_output_transform)
+        precision = Precision(output_transform=thresholded_output_transform)
+        recall = Recall(output_transform=thresholded_output_transform)
+        for step, samples in enumerate(test_dat):
+            inputs = samples[0]
+            # grab the y_true label
+            labels = samples[1]
+
+            # determine the y_pred
+            output = model(inputs)
+            _, predicted = torch.max(output.data, 1)
+            print('about to get the accuracies')
+            print(predicted)
+            print(labels)
+            binary_accuracy.update((predicted, labels))
+            precision.update((predicted, labels))
+            recall.update((predicted, labels))
+        print('Model accuracy : ', binary_accuracy.compute())
+        print('Model Precision : ', precision.compute().item())
+        print('Model Recall : ', recall.compute().item())
+
+
+
+def epoch_controller():
+    # setup models and activation models required for model training and image generation
+    args = arg_parse()
+    init_process_group()
+    index_file = args.index_file
+    num_epochs = args.epochs
+    run_perturbed = args.run_perturbed
+    run_clean = args.run_clean
+
+    # decide if we want to run with perturbed images
+    if run_perturbed:
+        perturbed = True
+    else:
+        perturbed = False
+
+    training_data, test_data, num_samples = prepare_data(index_file)
+    batch_sizes = [num_samples]
+    input_size = [112, 112]
+
+    # setup noise object
+    noise_accumulation = NoisyAccumulation.NoisyAccumulation(budget_mean=4)
+
+    # setup IR model
+    if run_clean:
+        irse_model = IRSEModel.IRSEModel(input_size, 50, 'ir', normal_image=True)
+    else:
+        irse_model = IRSEModel.IRSEModel(input_size, 50, 'ir')
+    save_epochs = [10, 18, 22, 24]
+    losses = OrderedDict()
+
+    noise_opt = get_noise_opt(noise_accumulation)
+    lr_noise = [0.1, 0.01, 0.001, 0.0001]
+    stages = [10, 18, 22]
+    for epoch in range(num_epochs):
+        # update noise opt if epoch matches expected
+        #epoch_index = save_epochs.index(epoch)
+        if (epoch in save_epochs):
+            # update the learning rate for the noise_opt
+            epoch_index = save_epochs.index(epoch)
+            adjust_lr(epoch, lr_noise, stages, noise_opt)
+
+        losses[epoch] = main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, run_perturbed=perturbed)
+
+
+    print(losses)
+    compute_validation_score(irse_model, test_data)
+
+
 
 if __name__ == "__main__":
-    main()
+    epoch_controller()

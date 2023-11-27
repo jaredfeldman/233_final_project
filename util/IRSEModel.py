@@ -228,8 +228,22 @@ def get_blocks(num_layers):
 
     return blocks
 
+def get_blocks_normal_image(num_layers):
+    '''
+    This method is to obtain blocks
+    '''
+    if num_layers == 50:
+        blocks = [
+            get_block(in_channel=156, depth=64, num_units=3),
+            get_block(in_channel=156, depth=128, num_units=4),
+            get_block(in_channel=128, depth=256, num_units=14),
+            get_block(in_channel=256, depth=512, num_units=3)
+        ]
+
+    return blocks
+
 class IRSEModel(Module):
-    def __init__(self, input_size, num_layers, mode='ir'):
+    def __init__(self, input_size, num_layers, mode='ir', normal_image=False):
         """ Args:
             input_size: input_size of backbone
             num_layers: num_layers of backbone
@@ -242,26 +256,43 @@ class IRSEModel(Module):
             "num_layers should be 18, 34, 50, 100 or 152"
         assert mode in ['ir', 'ir_se'], \
             "mode should be ir or ir_se"
+
         # don't set the first arg for Conv2d to anything but 1! don;t know why yet
         # https://stackoverflow.com/questions/56675943/meaning-of-parameters-in-torch-nn-conv2d
         # changed from (Conv2d(3, 64, (3, 3), 1, 1, bias=False) to the thing below
-        self.input_layer = Sequential(Conv2d(189, 64, (3, 3), 1, 1, bias=False),
-                                      BatchNorm2d(64), PReLU(64))
+        print('got here')
+        if not normal_image:
+            self.input_layer = Sequential(Conv2d(189, 64, (3, 3), 1, 1, bias=False),
+                                              BatchNorm2d(64), PReLU(64))
+        else:
+            self.input_layer = Sequential(Conv2d(in_channels=3,out_channels=64,kernel_size=(3,3),stride=(2,2),padding=(1,1)),
+                                              BatchNorm2d(64), PReLU(64))
 
         blocks = get_blocks(num_layers)
+
         if num_layers <= 100:
             unit_module = BasicBlockIR
             output_channel = 512
         else:
             unit_module = BottleneckIR
             output_channel = 2048
-
+        print('got passed')
+        print(num_layers)
+        print(output_channel)
         if input_size[0] == 112:
-            self.output_layer = Sequential(BatchNorm2d(output_channel),
-                                           Dropout(0.4), Flatten(),
-                                           Linear(output_channel * 7 * 7, 512),
-                                           InstanceNorm1d(512, affine=False))  # was BatchNorm1d, but since we're only passing one image right now, have to use instance instead
-                                           #https://discuss.pytorch.org/t/error-expected-more-than-1-value-per-channel-when-training/26274/6?filter=summary
+            print('in heeerrreeee')
+            if not normal_image:
+                self.output_layer = Sequential(BatchNorm2d(output_channel),
+                                               Dropout(0.4), Flatten(),
+                                               Linear(output_channel * 7 * 7, 512),
+                                               InstanceNorm1d(512, affine=False))  # was BatchNorm1d, but since we're only passing one image right now, have to use instance instead
+                                               #https://discuss.pytorch.org/t/error-expected-more-than-1-value-per-channel-when-training/26274/6?filter=summary
+            else:
+                self.output_layer = Sequential(BatchNorm2d(output_channel),
+                                               Dropout(0.4), Flatten(),
+                                               Linear(8192, 512),
+                                               InstanceNorm1d(512, affine=False))
+
         else:
             self.output_layer = Sequential(
                 BatchNorm2d(output_channel), Dropout(0.4), Flatten(),
@@ -276,10 +307,14 @@ class IRSEModel(Module):
                                 bottleneck.stride))
         self.body = Sequential(*modules)
         initialize_weights(self.modules())
+        print('got to end of init')
 
     def forward(self, x):
-        x = self.input_layer(x)
+        print('attempting to forward 2')
         print(x.shape)
+        x = self.input_layer(x)
+        print('attempting to forward 3')
         x = self.body(x)
+        print('attempting to forward 4')
         x = self.output_layer(x)
         return x

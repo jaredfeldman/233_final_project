@@ -1,7 +1,10 @@
 import os
 from torch.utils.data import Dataset
 from skimage import transform as trans
+from sklearn import preprocessing
 import cv2
+import torch
+from ignite.utils import to_onehot
 # This class is used to store imaged and labels in a Dataset type object
 
 class ImageDataset(Dataset):
@@ -61,7 +64,7 @@ class ImageDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = self.transform(image)
 
-        return image, label
+        return image, int(label)
 
     def __getitem__(self, index):
       """ Parse image and label data from index
