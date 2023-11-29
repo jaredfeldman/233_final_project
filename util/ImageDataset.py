@@ -5,6 +5,7 @@ from sklearn import preprocessing
 import cv2
 import torch
 from ignite.utils import to_onehot
+from sklearn.preprocessing import LabelEncoder
 # This class is used to store imaged and labels in a Dataset type object
 
 class ImageDataset(Dataset):
@@ -63,8 +64,7 @@ class ImageDataset(Dataset):
         image = self.rescale_image(image)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = self.transform(image)
-
-        return image, int(label)
+        return image, label
 
     def __getitem__(self, index):
       """ Parse image and label data from index

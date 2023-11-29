@@ -18,19 +18,21 @@ from collections import OrderedDict
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
 from ignite.metrics import Accuracy, Precision, Recall
-
+import torch.nn as nn
 from PIL import Image, ImageEnhance
 
 import tensorflow as tf
 from tensorflow import keras
 from keras import metrics
 tf.get_logger().setLevel('INFO')
-from util import ImageDataset, NoisyAccumulation, IRSEModel, AllGather, ArcFace, AverageMeter, DistCrossEntropy
+from util import ImageDataset, NoisyAccumulation, IRSEModel, AllGather, ArcFace, AverageMeter, DistCrossEntropy, ImageCNN
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torchjpeg import dct
 from sklearn import preprocessing
 from ignite.utils import to_onehot
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import LabelEncoder
 
 
 """
@@ -80,8 +82,8 @@ def prepare_data(index_file, test_size=0.2):
 
     # Use DataLoader to create an iteratable object
     print('Read in a total of ' + str(len(train_idx) + len(val_idx)) + ' samples.')
-    train_data_loader = DataLoader(train_dataset, len(train_idx), drop_last=False)
-    test_data_loader = DataLoader(train_dataset, len(val_idx), drop_last=False)
+    train_data_loader = DataLoader(train_dataset, len(train_idx), drop_last=True)
+    test_data_loader = DataLoader(train_dataset, len(val_idx), drop_last=True)
     return train_data_loader, test_data_loader, len(train_idx)
 
 """
@@ -308,72 +310,59 @@ def main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, 
 
     backbone_opt, head_opts, noise_opt = optimizer['backbone'], list(optimizer['heads'].values()), noise_opt
 
+    label_encoder = LabelEncoder()
+
+    if not run_perturbed:
+        cnnModel = ImageCNN.ImageCNN(normal_image=True)
+    else:
+        cnnModel = ImageCNN.ImageCNN()
+    print('Printing out the model skel')
+    print(cnnModel)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(cnnModel.parameters(), lr=0.001)
+    train_losses = []
+    val_losses = []
 
     # loop through each sample in the dataloader object
     for step, samples in enumerate(training_data):
         inputs = samples[0]
         labels_arr = samples[1]
-        le = preprocessing.LabelEncoder()
-        targets = le.fit_transform(labels_arr)
-        targets = torch.as_tensor(targets)
-        labels = targets
+
+        # change to one hot encoding
+        label_encoder.fit(labels_arr)
+        labels_encoded = label_encoder.transform(labels_arr)
+        onehot_encoder = OneHotEncoder(sparse=False)
+        integer_encoded = labels_encoded.reshape(len(labels_encoded), 1)
+        labels = onehot_encoder.fit_transform(integer_encoded)
+
+        labels = torch.from_numpy(labels)
 
         if(run_perturbed):
             inputs = images_to_batch(inputs)
             inputs = noise_accumulation(inputs)
 
+        # zero grad
+        optimizer.zero_grad()
 
-        print(inputs.shape)
-        features = irse_model(inputs)
+        output = cnnModel(inputs)
 
-        features_gather = AllGather.AllGather(features, 1)
-        features_gather = [torch.split(x, batch_sizes) for x in features_gather] # set to the number of images incoming
-        all_features = []
-        for i in range(len(batch_sizes)):
-            all_features.append(torch.cat([x[i] for x in features_gather], dim=0))
+        loss = criterion(output, labels)
 
-        with torch.no_grad():
-            labels_gather = AllGather.AllGather(labels, 1)
+        running_loss += loss.item() * images.size(0)
 
-        labels_gather = [torch.split(x, batch_sizes) for x in labels_gather]
-        all_labels = []
-        for i in range(len(batch_sizes)):
-            all_labels.append(torch.cat([x[i] for x in labels_gather], dim=0))
+        loss.backward()
 
-        losses = []
+        optimizer.step()
 
-        am_losses = [AverageMeter.AverageMeter() for _ in batch_sizes]
-        am_top1s = [AverageMeter.AverageMeter() for _ in batch_sizes]
-        am_top5s = [AverageMeter.AverageMeter() for _ in batch_sizes]
+    epoch_train_loss = running_loss / len(train_loader.dataset)
+    print('Epoch {}, train loss : {}'.format(e, epoch_train_loss))
 
-        for i in range(len(batch_sizes)):
-            outputs, labels, original_outputs = heads[i](all_features[i], all_labels[i])
+    train_losses.append(epoch_train_loss)
+    cnnModel.eval()
 
-            loss = setup_loss()
-            loss = loss(outputs, labels)
-            print("labels we're sending to")
-            print(labels.shape)
-            losses.append(loss)
-            prec1 = accuracy_dist(original_outputs.data, all_labels[i], class_shard, topk=(1,num_samples))
-            am_losses[i].update(loss.data.item(), all_features[i].size(0))
 
-        # update summary and log_buffer
-        scalars = {
-            'train/loss': am_losses,
-        }
 
-        total_loss = sum(losses)
-        print(total_loss)
-
-        # compute gradient and do SGD
-        backbone_opt.zero_grad()
-        noise_opt.zero_grad()
-        for head_opt in head_opts:
-            head_opt.zero_grad()
-
-        #print(total_loss)
-
-    return total_loss
+    return total_loss, cnnModel
 
 def set_optimizer_lr(optimizer, lr):
     if isinstance(optimizer, dict):
@@ -406,6 +395,7 @@ def thresholded_output_transform(output):
     return y_pred, y_ohe
 
 def compute_validation_score(model , test_dat):
+    label_encoder = LabelEncoder()
     with torch.no_grad():
         binary_accuracy = Accuracy(output_transform=thresholded_output_transform)
         precision = Precision(output_transform=thresholded_output_transform)
@@ -414,10 +404,13 @@ def compute_validation_score(model , test_dat):
             inputs = samples[0]
             # grab the y_true label
             labels = samples[1]
+            label_encoder.fit(labels)
+            labels = label_encoder.transform(labels)
 
             # determine the y_pred
             output = model(inputs)
             _, predicted = torch.max(output.data, 1)
+            labels = torch.from_numpy(labels)
             print('about to get the accuracies')
             print(predicted)
             print(labels)
@@ -471,11 +464,11 @@ def epoch_controller():
             epoch_index = save_epochs.index(epoch)
             adjust_lr(epoch, lr_noise, stages, noise_opt)
 
-        losses[epoch] = main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, run_perturbed=perturbed)
+        losses[epoch], model = main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, run_perturbed=perturbed)
 
 
     print(losses)
-    compute_validation_score(irse_model, test_data)
+    compute_validation_score(model, test_data)
 
 
 

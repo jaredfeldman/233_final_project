@@ -13,12 +13,7 @@ Pass in the path to the root directory of the training images and the name of th
 # iterate over all the files and subdirs in the provided imgs dir and grab the filenames
 def get_all_gpgs(subdir):
 	target_dir = os.path.join(subdir)
-	label_translation = {
-		'Asian': 0,
-		'African': 1,
-		'Caucasian': 2,
-		'Indian': 3
-	}
+	label_translation = []
 
 	f = []
 	w = os.walk(target_dir)
@@ -26,7 +21,7 @@ def get_all_gpgs(subdir):
 		if 'jpg' in '\t'.join(filenames):
 			for file in filenames:
 				image_subdir = dirpath.replace(subdir,'')
-				label = label_translation[image_subdir.split('/')[0]]
+				label = image_subdir.split('/')[1]
 				f.append(str(label) + ' ' + os.path.join(dirpath, file))
 
 	return f
