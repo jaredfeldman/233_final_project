@@ -35,6 +35,7 @@ from ignite.utils import to_onehot
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import LabelEncoder
 import scipy
+from scipy.fftpack import idct
 
 
 """
@@ -88,12 +89,44 @@ def prepare_data(index_file, test_size=0.2):
 """
 This is where the DCT magic happens
 """
+def block_idct(dct_block):
+    """
+    Apply Inverse Discrete Cosine Transform (IDCT) to each 8x8 block.
+    Args:
+    dct_block (numpy.ndarray): An array of DCT coefficients.
+    Returns:
+    numpy.ndarray: The reconstructed image blocks after IDCT.
+    """
+    # Define a function to apply IDCT to a single block
+    def idct_2d(block):
+        # Apply IDCT in both dimensions
+        return idct(idct(block.T, norm='ortho').T, norm='ortho')
+    # Assuming the input is of shape (bs, ch, h, w)
+    bs, ch, h, w = dct_block.shape
+    # Initialize an empty array for the output
+    idct_image = np.zeros_like(dct_block, dtype=np.float32)
+    # Apply IDCT to each block
+    for b in range(bs):
+        for c in range(ch):
+            for i in range(0, h, 8):
+                for j in range(0, w, 8):
+                    # Extract the block
+                    block = dct_block[b, c, i:i+8, j:j+8]
+                    # Perform IDCT
+                    idct_image[b, c, i:i+8, j:j+8] = idct_2d(block)
+    return idct_image
+
 def images_to_batch(x):
+
     # input has range -1 to 1, this changes to range from 0 to 255
     x = (x + 1) / 2 * 255
+    print('Step 1')
+    print(x.shape)
 
     # scale_factor=8 does the blockify magic
     x = F.interpolate(x, scale_factor=8, mode='bilinear', align_corners=True)
+    print('Step 2')
+    print(x.shape)
 
     # raise error if # of channels does not equal 3
     if x.shape[1] != 3:
@@ -102,43 +135,74 @@ def images_to_batch(x):
 
     # convert to ycbcr
     x = dct.to_ycbcr(x)  # convert RGB to YCBCR
+    print('Step 3')
+    print(x.shape)
 
     # DCT is designed to work on values ranging from -128 to 127
     # Subtracting 128 from values 0-255 will change range to be -128 to 127
     # https://www.math.cuhk.edu.hk/~lmlui/dct.pdf
     x -= 128
+    print('Step 4')
 
     # assign variables batch size, channel, height, weight based on x.shape
     bs, ch, h, w = x.shape
+    print('Step 5')
+    print(x.shape)
 
     # set the number of blocks
     block_num = h // 8
     # gives you insight of the stack that is fed into the "upsampling" piece
     x = x.view(bs * ch, 1, h, w)
+    print('Step 6')
+    print(x.shape)
 
     # 8 fold upsampling
     x = F.unfold(x, kernel_size=(8, 8), dilation=1, padding=0,
                  stride=(8, 8))
+    print('Step 7')
+    print(x.shape)
 
     # transposed to be able to feed into dct
     x = x.transpose(1, 2)
+    print('Step 8')
+    print(x.shape)
     x = x.view(bs, ch, -1, 8, 8)
+    print('Step 9')
+    print(x.shape)
 
     # do dct
     dct_block = dct.block_dct(x)
-
+    print('Step 10')
+    print(dct_block.shape)
     dct_block = dct_block.view(bs, ch, block_num, block_num, 64).permute(0, 1, 4, 2, 3)
-
+    print('Step 11')
+    print(dct_block.shape)
     # remove DC as its important for visualization, but not recognition
     dct_block = dct_block[:, :, 1:, :, :]
-
+    print('Step 12')
+    print(dct_block.shape)
     # gather
     print('Before reshape')
     print(dct_block.shape)
-    dct_block = dct_block.reshape(bs, -1, block_num, block_num)
-    print('reshaped')
-    print(dct_block.shape)
-    return dct_block
+    #dct_block = dct_block.reshape(bs, -1, block_num, block_num)
+
+    dc_coefficient = torch.zeros(bs, ch, 1, h // 8, w // 8, device=dct_block.device)
+    dct_block = torch.cat((dc_coefficient, dct_block), dim=2)
+    # Reshape to the format suitable for inverse DCT
+    dct_block = dct_block.permute(0, 1, 3, 4, 2).reshape(bs, ch, h, w)
+    # Apply inverse DCT
+    x = dct.block_idct(dct_block)  # Assuming your dct module has a block_idct function
+    # Add 128 to each pixel
+    x += 128
+    # Convert from YCbCr to RGB
+    x = dct.to_rgb(x)  # Convert YCbCr back to RGB
+    # Normalize the image back to the range -1 to 1
+    x = F.interpolate(x, scale_factor=1/8, mode='bilinear', align_corners=True)
+    x = (x / 255) * 2 - 1
+
+    print('Final idcted')
+    print(x.shape)
+    return x
 
 def expand_tensor(x):
     # scale_factor=8 does the blockify magic
@@ -332,14 +396,14 @@ def main(noise_accumulation, training_data, num_samples, noise_opt, running_loss
 
         # change to one hot encoding
         inputs = images_to_batch(inputs)
-        print(inputs.shape)
+        #print(inputs.shape)
 
         """
         if(run_perturbed):
             inputs = images_to_batch(inputs)
             inputs = noise_accumulation(inputs)
         """
-        """
+
         # zero grad
         optimizer.zero_grad()
         print('Start training')
@@ -356,8 +420,8 @@ def main(noise_accumulation, training_data, num_samples, noise_opt, running_loss
 
     epoch_train_loss = running_loss / len(training_data.dataset)
     print('Epoch {}, train loss : {}'.format(e, epoch_train_loss))
+    return cnnModel
 
-    """
     """
     epoch_train_loss = running_loss / len(train_loader.dataset)
     print('Epoch {}, train loss : {}'.format(e, epoch_train_loss))
@@ -367,7 +431,7 @@ def main(noise_accumulation, training_data, num_samples, noise_opt, running_loss
     """
 
 
-    return epoch_train_loss
+    #return epoch_train_loss
 
 
 def set_optimizer_lr(optimizer, lr):
@@ -402,6 +466,7 @@ def thresholded_output_transform(output):
 
 def compute_validation_score(model , test_dat):
     label_encoder = LabelEncoder()
+    # tirm down the
     with torch.no_grad():
         binary_accuracy = Accuracy(output_transform=thresholded_output_transform)
         precision = Precision(output_transform=thresholded_output_transform)
@@ -477,7 +542,7 @@ def epoch_controller():
 
 
     #print(losses)
-    #compute_validation_score(model, test_data)
+    #compute_validation_score(model, training_data)
 
 
 
