@@ -9,8 +9,9 @@ from PIL import Image
 import os
 from IPython.display import display, HTML
 import cv2
-import torchvision.transforms as transforms
+from torchvision import transforms, datasets
 import torch.distributed as dist
+from typing import List
 import torch.nn.init as init
 import torch.optim as optim
 import torch.cpu.amp as amp
@@ -33,6 +34,7 @@ from sklearn import preprocessing
 from ignite.utils import to_onehot
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import LabelEncoder
+import scipy
 
 
 """
@@ -56,6 +58,11 @@ def arg_parse():
     args = parser.parse_args()
     return args
 
+def target_to_oh(target):
+    NUM_CLASS = 12  # hard code here, can do partial
+    one_hot = torch.eye(NUM_CLASS)[target]
+    return one_hot
+
 """
 Used to setup ImageDataset, load in data, and create an iterable
 """
@@ -65,26 +72,18 @@ def prepare_data(index_file, test_size=0.2):
 
     # series of transformations
     transform = transforms.Compose([
-        transforms.ToPILImage(), # convert image to PIL for easier matplotlib reading
+        transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(), # apply some random flip for data augmentation
         transforms.ToTensor(), # convert the flipped image back to a pytorch tensor
         transforms.Normalize(mean=rgb_mean, std=rgb_std) # normalize the tensor using mean and std from above
     ])
     # setup the dataset
-    image_dataset = ImageDataset.ImageDataset(index_file, transform)
-    # read in the data
-    image_dataset.build_inputs()
-
+    data_dir = '../Data/filtered'
     # train/test split
-    train_idx, val_idx = train_test_split(list(range(len(image_dataset))), test_size=test_size)
-    train_dataset = Subset(image_dataset, train_idx)
-    validation_dataset = Subset(image_dataset, val_idx)
-
+    train_data = datasets.ImageFolder(data_dir, transform, target_transform=target_to_oh)
     # Use DataLoader to create an iteratable object
-    print('Read in a total of ' + str(len(train_idx) + len(val_idx)) + ' samples.')
-    train_data_loader = DataLoader(train_dataset, len(train_idx), drop_last=True)
-    test_data_loader = DataLoader(train_dataset, len(val_idx), drop_last=True)
-    return train_data_loader, test_data_loader, len(train_idx)
+    train_data_loader = DataLoader(train_data, batch_size=len(train_data), shuffle=True)
+    return train_data_loader, len(train_data)
 
 """
 This is where the DCT magic happens
@@ -134,7 +133,11 @@ def images_to_batch(x):
     dct_block = dct_block[:, :, 1:, :, :]
 
     # gather
+    print('Before reshape')
+    print(dct_block.shape)
     dct_block = dct_block.reshape(bs, -1, block_num, block_num)
+    print('reshaped')
+    print(dct_block.shape)
     return dct_block
 
 def expand_tensor(x):
@@ -282,7 +285,7 @@ def get_noise_opt(noise_model):
     optimizer = optim.Adam(list(noise_model.parameters()), lr=lrs_noise[0])
     return optimizer
 
-def main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, run_perturbed=False):
+def main(noise_accumulation, training_data, num_samples, noise_opt, running_loss, e, run_perturbed=False):
     # setup the arguments required for this script
     #args = arg_parse()
     #init_process_group()
@@ -296,26 +299,13 @@ def main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, 
     #noise_accumulation = NoisyAccumulation.NoisyAccumulation(budget_mean=4)
     noise_accumulation.train()
 
-    # setup IR model
-    #irse_model = IRSEModel.IRSEModel(input_size, 50, 'ir')
-
-    # setup arcface
-    heads = OrderedDict()
-    head, class_shard = setup_arc_face(num_samples)
-    heads[0] = head
 
 
-    optimizer = get_optimizer(irse_model, heads)
-    noise_opt = get_noise_opt(noise_accumulation)
 
-    backbone_opt, head_opts, noise_opt = optimizer['backbone'], list(optimizer['heads'].values()), noise_opt
-
-    label_encoder = LabelEncoder()
-
-    if not run_perturbed:
-        cnnModel = ImageCNN.ImageCNN(normal_image=True)
-    else:
-        cnnModel = ImageCNN.ImageCNN()
+    #if not run_perturbed:
+        #cnnModel = ImageCNN.ImageCNN(normal_image=True)
+    #else:
+    cnnModel = ImageCNN.ImageCNN()
     print('Printing out the model skel')
     print(cnnModel)
     criterion = nn.CrossEntropyLoss()
@@ -323,46 +313,62 @@ def main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, 
     train_losses = []
     val_losses = []
 
+
+    # TODO:
+    # Use the transforms to resize -- DONE
+    # Update how we're labelling to be the one-hot encoded version -- DONE
+    # Update the training portion of the model and replace it with the unperturbed images -- DONE
+    # Investigate why the perturbed image has different number of channels
+    # Run predictions against perturbed images
+    # measure the accuracy, precision and recall
+
+
     # loop through each sample in the dataloader object
     for step, samples in enumerate(training_data):
         inputs = samples[0]
-        labels_arr = samples[1]
+        labels = samples[1]
+        print('Labels')
+        print(labels.shape)
 
         # change to one hot encoding
-        label_encoder.fit(labels_arr)
-        labels_encoded = label_encoder.transform(labels_arr)
-        onehot_encoder = OneHotEncoder(sparse=False)
-        integer_encoded = labels_encoded.reshape(len(labels_encoded), 1)
-        labels = onehot_encoder.fit_transform(integer_encoded)
+        inputs = images_to_batch(inputs)
+        print(inputs.shape)
 
-        labels = torch.from_numpy(labels)
-
+        """
         if(run_perturbed):
             inputs = images_to_batch(inputs)
             inputs = noise_accumulation(inputs)
-
+        """
+        """
         # zero grad
         optimizer.zero_grad()
-
+        print('Start training')
         output = cnnModel(inputs)
 
         loss = criterion(output, labels)
 
-        running_loss += loss.item() * images.size(0)
+        running_loss += loss.item() * inputs.size(0)
 
         loss.backward()
 
         optimizer.step()
 
+
+    epoch_train_loss = running_loss / len(training_data.dataset)
+    print('Epoch {}, train loss : {}'.format(e, epoch_train_loss))
+
+    """
+    """
     epoch_train_loss = running_loss / len(train_loader.dataset)
     print('Epoch {}, train loss : {}'.format(e, epoch_train_loss))
 
     train_losses.append(epoch_train_loss)
     cnnModel.eval()
+    """
 
 
+    return epoch_train_loss
 
-    return total_loss, cnnModel
 
 def set_optimizer_lr(optimizer, lr):
     if isinstance(optimizer, dict):
@@ -438,37 +444,40 @@ def epoch_controller():
     else:
         perturbed = False
 
-    training_data, test_data, num_samples = prepare_data(index_file)
+    training_data, num_samples = prepare_data(index_file)
     batch_sizes = [num_samples]
     input_size = [112, 112]
+
+    print("Got the images back from the data loader")
+    print(len(training_data.dataset))
 
     # setup noise object
     noise_accumulation = NoisyAccumulation.NoisyAccumulation(budget_mean=4)
 
-    # setup IR model
-    if run_clean:
-        irse_model = IRSEModel.IRSEModel(input_size, 50, 'ir', normal_image=True)
-    else:
-        irse_model = IRSEModel.IRSEModel(input_size, 50, 'ir')
     save_epochs = [10, 18, 22, 24]
     losses = OrderedDict()
 
     noise_opt = get_noise_opt(noise_accumulation)
     lr_noise = [0.1, 0.01, 0.001, 0.0001]
     stages = [10, 18, 22]
+    running_loss = 0
+    train_losses = []
     for epoch in range(num_epochs):
         # update noise opt if epoch matches expected
         #epoch_index = save_epochs.index(epoch)
-        if (epoch in save_epochs):
+        #if (epoch in save_epochs):
             # update the learning rate for the noise_opt
-            epoch_index = save_epochs.index(epoch)
-            adjust_lr(epoch, lr_noise, stages, noise_opt)
+            #epoch_index = save_epochs.index(epoch)
+            #adjust_lr(epoch, lr_noise, stages, noise_opt)
 
-        losses[epoch], model = main(irse_model, noise_accumulation, training_data, num_samples, noise_opt, run_perturbed=perturbed)
+        #losses[epoch], model = main(noise_accumulation, training_data, num_samples, noise_opt, run_perturbed=perturbed)
+        train_losses.append(main(noise_accumulation, training_data, num_samples, noise_opt, running_loss, epoch, run_perturbed=perturbed))
+
+    print(train_losses)
 
 
-    print(losses)
-    compute_validation_score(model, test_data)
+    #print(losses)
+    #compute_validation_score(model, test_data)
 
 
 
