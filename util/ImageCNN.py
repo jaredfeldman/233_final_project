@@ -11,7 +11,9 @@ import matplotlib.pyplot as plt
 
 import numpy as np
 
-
+"""
+Basic image recognition model
+"""
 class ImageCNN(nn.Module):
     def __init__(self):
         super(ImageCNN, self).__init__()
@@ -59,8 +61,6 @@ class ImageCNN(nn.Module):
 
         x = F.relu(self.conv4(x), inplace=True)
         x = self.pool(self.batch4(x))
-        print('shape before error')
-        print(x.shape)
         x = x.view(-1, 64 * 7 * 7)
 
         x = F.relu(self.fc1(x))
