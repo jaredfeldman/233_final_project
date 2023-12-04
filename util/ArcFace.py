@@ -101,6 +101,10 @@ class ArcFace(CommonFace):
 
     def forward(self, embeddings, labels):
         index, part_labels, cos_theta, original_logits = self._calc_logits(embeddings, labels)
+        print('in forward .....')
+        print(index.type)
+        print(index)
+        print(part_labels[index])
         target_logit = cos_theta[index, part_labels[index].view(-1)]
 
         sin_theta = torch.sqrt(1.0 - torch.pow(target_logit, 2))
