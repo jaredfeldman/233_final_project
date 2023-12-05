@@ -10,11 +10,11 @@ class NoisyAccumulation(nn.Module): # updated the default value for input_shape
         super(NoisyAccumulation, self).__init__()
         self.h, self.w = input_shape, input_shape
         if sensitivity is None:
-            sensitivity = torch.ones([189, self.h, self.w])
-        self.sensitivity = sensitivity.reshape(189 * self.h * self.w)
-        self.given_locs = torch.zeros((189, self.h, self.w))
+            sensitivity = torch.ones([3, self.h, self.w])
+        self.sensitivity = sensitivity.reshape(3 * self.h * self.w)
+        self.given_locs = torch.zeros((3, self.h, self.w))
         size = self.given_locs.shape
-        self.budget = budget_mean * 189 * self.h * self.w
+        self.budget = budget_mean * 3 * self.h * self.w
         self.locs = nn.Parameter(torch.Tensor(size).copy_(self.given_locs))
         self.rhos = nn.Parameter(torch.zeros(size))
         self.laplace = torch.distributions.laplace.Laplace(0, 1)
@@ -23,8 +23,8 @@ class NoisyAccumulation(nn.Module): # updated the default value for input_shape
 
     def scales(self):
         softmax = nn.Softmax()
-        return (self.sensitivity / (softmax(self.rhos.reshape(189 * self.h * self.w))
-                * self.budget)).reshape(189, self.h, self.w)
+        return (self.sensitivity / (softmax(self.rhos.reshape(3 * self.h * self.w))
+                * self.budget)).reshape(3, self.h, self.w)
 
     def sample_noise(self):
         epsilon = self.laplace.sample(self.rhos.shape)

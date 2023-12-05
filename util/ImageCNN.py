@@ -46,8 +46,8 @@ class ImageCNN(nn.Module):
 
         self.drop = nn.Dropout(p=.3)
 
+    # this is where we go when we train the model
     def forward(self, x):
-
         x = F.relu(self.conv1(x), inplace=True)
         x = self.pool(self.batch1(x))
 

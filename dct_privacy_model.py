@@ -26,7 +26,7 @@ import tensorflow as tf
 from tensorflow import keras
 from keras import metrics
 tf.get_logger().setLevel('INFO')
-from util import ImageCNN
+from util import ImageCNN, NoisyAccumulation
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torchjpeg import dct
@@ -56,8 +56,7 @@ def arg_parse():
     parser = argparse.ArgumentParser(description='Train IRSE model with perturbed images based on DCT')
     parser.add_argument('--data-dir', help='path to images', required=True)
     parser.add_argument('--epochs', type=int, default=5, help='number of epochs to train the model based on')
-    parser.add_argument('--run-perturbed', default=False, action='store_true', help='Run training model with perturbed images')
-    parser.add_argument('--run-clean', default=False, action='store_true', help='Run the training model with normal images')
+    parser.add_argument('--print-images', default=False, action='store_true', help='Just print images')
 
     args = parser.parse_args()
     return args
@@ -190,22 +189,24 @@ def init_process_group():
 """
 Function used to compute the final accuracy, precision scores
 """
-def compute_validation_score(model , test_data):
+def compute_validation_score(model, test_data, noise_accumulation):
 
     for step, samples in enumerate(test_data):
         inputs = samples[0]
         labels = samples[1]
-
+        # perturb the image
         inputs = images_to_batch(inputs)
-
-        # determine the y_pred
+        inputs = noise_accumulation(inputs)
+        # get our r_pred
         output = model(inputs)
         _, predicted = torch.max(output.data, 1)
         _, labels_updated = torch.max(labels, 1)
+        # the above transforms the shapes of the predicted and labels from 773 x 12 -> 773
 
         precision = sklearn.metrics.precision_score(labels_updated, predicted, average="macro")
         accuracy = sklearn.metrics.accuracy_score(labels_updated, predicted)
-        print(tabulate([[accuracy, precision]], headers=['Model Accuracy', 'Model Precision']))
+        recall = sklearn.metrics.recall_score(labels_updated, predicted, average="macro")
+        print(tabulate([[accuracy, precision, recall]], headers=['Model Accuracy', 'Model Precision', 'Model Recall']))
 
 # TODO:
 # Use the transforms to resize -- DONE
@@ -219,8 +220,6 @@ def main(cnnModel, training_data, running_loss, e,):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(cnnModel.parameters(), lr=0.001)
     train_losses = []
-    val_losses = []
-
 
     # loop through each sample in the dataloader object
     for step, samples in enumerate(training_data):
@@ -240,6 +239,28 @@ def main(cnnModel, training_data, running_loss, e,):
     print('Epoch {}, train loss : {}'.format(e, epoch_train_loss))
     return cnnModel, epoch_train_loss
 
+def printing_images(training_data, noise_accumulation):
+    rgb_mean = [0.5, 0.5, 0.5] # for normalize inputs to [-1, 1]
+    rgb_std = [0.5, 0.5, 0.5]
+    transform = transforms.Compose([
+        transforms.ToPILImage(), # convert image to PIL for easier matplotlib reading
+        transforms.RandomHorizontalFlip(), # apply some random flip for data augmentation
+        transforms.ToTensor(), # convert the flipped image back to a pytorch tensor
+        transforms.Normalize(mean=rgb_mean, std=rgb_std) # normalize the tensor using mean and std from above
+    ])
+    for step, samples in enumerate(training_data):
+        inputs = samples[0]
+        labels = samples[1]
+
+        inputs = images_to_batch(inputs)
+        inputs = noise_accumulation(inputs)
+
+        # display the PIL Image
+        for image in inputs:
+            pil_img = transforms.ToPILImage()(image)
+
+            plt.imshow(pil_img, interpolation="bicubic")
+            plt.show()
 
 def epoch_controller():
     # setup models and activation models required for model training and image generation
@@ -247,30 +268,34 @@ def epoch_controller():
     #init_process_group()
     data_dir = args.data_dir
     num_epochs = args.epochs
+    print_images = args.print_images
 
     training_data, num_samples = prepare_data(data_dir)
+    noise_accumulation = NoisyAccumulation.NoisyAccumulation(budget_mean=4)
 
-    print("Using this many images to train: ", len(training_data.dataset))
+    if print_images:
+        printing_images(training_data, noise_accumulation)
+    else:
+        print("Using this many images to train: ", len(training_data.dataset))
 
-    save_epochs = [10, 18, 22, 24]
-    losses = OrderedDict()
+        save_epochs = [10, 18, 22, 24]
+        losses = OrderedDict()
 
-    lr_noise = [0.1, 0.01, 0.001, 0.0001]
-    stages = [10, 18, 22]
-    running_loss = 0
-    train_losses = []
-    cnnModel = ImageCNN.ImageCNN()
-    running_loss = 0
-    for epoch in range(num_epochs):
-        print("Training epoch: ", epoch)
-        cnnModel, training_loss = main(cnnModel, training_data, running_loss, epoch)
-        train_losses.append(training_loss)
-        running_loss = training_loss
+        noise_accumulation.train()
+        running_loss = 0
+        train_losses = []
+        cnnModel = ImageCNN.ImageCNN()
+        running_loss = 0
+        for epoch in range(num_epochs):
+            print("Training epoch: ", epoch)
+            cnnModel, training_loss = main(cnnModel, training_data, running_loss, epoch)
+            train_losses.append(training_loss)
+            running_loss = training_loss
 
-    print('Training losses:')
-    print(train_losses)
-    # compute validaion scores
-    compute_validation_score(cnnModel, training_data)
+        print('Training losses:')
+        print(train_losses)
+        # compute validaion scores
+        compute_validation_score(cnnModel, training_data, noise_accumulation)
 
 
 
